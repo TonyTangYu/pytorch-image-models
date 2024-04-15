@@ -41,6 +41,15 @@ from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
 from timm.utils import init_distributed_mode, cu_prof_start, cu_prof_stop
 
+has_tso = False
+try:
+    import tso
+    from tso.scheduling.runtime.rematerilize import DynamicRematerilizationDispatchMode
+    from tso.dispatch import ModelProfileDispatchMode, ComputingGraphTracerDispatchMode, ProfileDynamicRematerilizationDispatchMode
+    has_tso = True
+except:
+    pass
+
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -1015,8 +1024,12 @@ def train_one_epoch(
     update_time_m = utils.AverageMeter()
     data_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
+    memory_m = utils.AverageMeter()
 
     model.train()
+    memory_budget = None
+    if has_tso:
+        memory_budget: int = int(4e+9)
 
     accum_steps = args.grad_accum_steps
     last_accum_steps = len(loader) % accum_steps
@@ -1028,6 +1041,13 @@ def train_one_epoch(
     data_start_time = update_start_time = time.time()
     optimizer.zero_grad()
     update_sample_count = 0
+
+    # with DynamicRematerilizationDispatchMode(model,
+    #                                         activation_memory_budge=memory_budget,
+    #                                         use_mem_pred=False,
+    #                                         auto_evict_strategy_config = {"name": "HeuristicFunctionStrategy",
+    #                                                                         "func_name": "tso_mem"},
+    #                                         backend="py"):
     for batch_idx, (input, target) in enumerate(loader):
         last_batch = batch_idx == last_batch_idx
         need_update = last_batch or (batch_idx + 1) % accum_steps == 0
@@ -1090,6 +1110,8 @@ def train_one_epoch(
         if not need_update:
             data_start_time = time.time()
             continue
+        memory_allocated = torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024
+        memory_m.update(memory_allocated)
 
         num_updates += 1
         optimizer.zero_grad()
@@ -1119,7 +1141,8 @@ def train_one_epoch(
                     f'Time: {update_time_m.val:.3f}s, {update_sample_count / update_time_m.val:>7.2f}/s  '
                     f'({update_time_m.avg:.3f}s, {update_sample_count / update_time_m.avg:>7.2f}/s)  '
                     f'LR: {lr:.3e}  '
-                    f'Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})'
+                    f'Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})  '
+                    f'Mem: {memory_m.val:.3f}GB ({memory_m.avg:.3f}GB)'
                 )
 
                 if args.save_images and output_dir:
